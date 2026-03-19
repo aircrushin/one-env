@@ -9,10 +9,29 @@ import type {
 type RecordPatch = Partial<Omit<OneEnvRecord, 'pageId' | 'entityId'>>
 
 const DEFAULT_NOTION_LIST_CACHE_TTL_MS = 5_000
+const DEFAULT_REDIS_KEY_PREFIX = 'oneenv'
 
 type NotionPage = {
   id: string
   properties?: Record<string, unknown>
+}
+
+type NotionListCacheStore = {
+  getList(databaseId: string): Promise<OneEnvRecord[] | null>
+  setList(databaseId: string, records: OneEnvRecord[], ttlMs: number): Promise<void>
+  invalidateList(databaseId: string): Promise<void>
+}
+
+type RedisClient = {
+  connect: () => Promise<void>
+  get: (key: string) => Promise<string | null>
+  set: (key: string, value: string, options?: { EX?: number }): Promise<unknown>
+  del: (key: string) => Promise<number>
+  on?: (event: string, listener: (...args: unknown[]) => void) => unknown
+}
+
+type RedisModule = {
+  createClient?: (options: { url: string }) => RedisClient
 }
 
 export interface OneEnvRepository {
@@ -229,6 +248,152 @@ function parseNotionListCacheTtlMs(rawValue: string | undefined): number {
   return parsed
 }
 
+function getRedisUrlFromEnv(): string | null {
+  const value = process.env.ONEENV_REDIS_URL ?? process.env.REDIS_URL
+  if (!value) {
+    return null
+  }
+
+  const normalized = value.trim()
+  return normalized ? normalized : null
+}
+
+function getRedisKeyPrefixFromEnv(): string {
+  const value = process.env.ONEENV_REDIS_KEY_PREFIX
+  if (!value) {
+    return DEFAULT_REDIS_KEY_PREFIX
+  }
+
+  const normalized = value.trim()
+  return normalized || DEFAULT_REDIS_KEY_PREFIX
+}
+
+function isOneEnvRecord(value: unknown): value is OneEnvRecord {
+  if (!value || typeof value !== 'object') {
+    return false
+  }
+
+  const candidate = value as Partial<OneEnvRecord>
+  return typeof candidate.pageId === 'string' && typeof candidate.entityId === 'string'
+}
+
+class RedisNotionListCacheStore implements NotionListCacheStore {
+  private readonly clientPromise: Promise<RedisClient | null>
+
+  constructor(
+    private readonly redisUrl: string,
+    private readonly keyPrefix: string,
+  ) {
+    this.clientPromise = this.connectClient()
+  }
+
+  private listCacheKey(databaseId: string): string {
+    return `${this.keyPrefix}:notion:list:${databaseId}`
+  }
+
+  private async connectClient(): Promise<RedisClient | null> {
+    try {
+      const moduleName = 'redis'
+      const redisModule = (await import(moduleName)) as RedisModule
+      if (!redisModule.createClient) {
+        console.warn('[oneenv] redis package is missing createClient export, skip redis cache')
+        return null
+      }
+
+      const client = redisModule.createClient({ url: this.redisUrl })
+      client.on?.('error', (error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        console.error(`[oneenv] redis cache runtime error: ${message}`)
+      })
+      await client.connect()
+      return client
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      console.warn(`[oneenv] redis cache disabled, fallback to memory cache: ${message}`)
+      return null
+    }
+  }
+
+  async getList(databaseId: string): Promise<OneEnvRecord[] | null> {
+    const client = await this.clientPromise
+    if (!client) {
+      return null
+    }
+
+    try {
+      const cacheKey = this.listCacheKey(databaseId)
+      const raw = await client.get(cacheKey)
+      if (!raw) {
+        return null
+      }
+
+      const parsed = JSON.parse(raw) as unknown
+      if (!Array.isArray(parsed)) {
+        return null
+      }
+
+      const records = parsed.filter(isOneEnvRecord)
+      return records.length === parsed.length ? records : null
+    } catch {
+      return null
+    }
+  }
+
+  async setList(
+    databaseId: string,
+    records: OneEnvRecord[],
+    ttlMs: number,
+  ): Promise<void> {
+    const client = await this.clientPromise
+    if (!client || ttlMs <= 0) {
+      return
+    }
+
+    const ttlSeconds = Math.max(1, Math.ceil(ttlMs / 1_000))
+    try {
+      const cacheKey = this.listCacheKey(databaseId)
+      await client.set(cacheKey, JSON.stringify(records), { EX: ttlSeconds })
+    } catch {
+      // Keep request path resilient even when cache writes fail.
+    }
+  }
+
+  async invalidateList(databaseId: string): Promise<void> {
+    const client = await this.clientPromise
+    if (!client) {
+      return
+    }
+
+    try {
+      const cacheKey = this.listCacheKey(databaseId)
+      await client.del(cacheKey)
+    } catch {
+      // Best-effort invalidation to avoid breaking writes.
+    }
+  }
+}
+
+let sharedNotionListCacheStore: NotionListCacheStore | null | undefined
+
+function getNotionListCacheStore(): NotionListCacheStore | null {
+  if (sharedNotionListCacheStore !== undefined) {
+    return sharedNotionListCacheStore
+  }
+
+  const redisUrl = getRedisUrlFromEnv()
+  if (!redisUrl) {
+    sharedNotionListCacheStore = null
+    return sharedNotionListCacheStore
+  }
+
+  sharedNotionListCacheStore = new RedisNotionListCacheStore(
+    redisUrl,
+    getRedisKeyPrefixFromEnv(),
+  )
+
+  return sharedNotionListCacheStore
+}
+
 class NotionRepository implements OneEnvRepository {
   private listCache: {
     records: OneEnvRecord[]
@@ -246,6 +411,7 @@ class NotionRepository implements OneEnvRepository {
     private readonly listCacheTtlMs = parseNotionListCacheTtlMs(
       process.env.NOTION_LIST_CACHE_TTL_MS,
     ),
+    private readonly listCacheStore: NotionListCacheStore | null = null,
   ) {}
 
   private async notionFetch(path: string, init?: RequestInit): Promise<Response> {
@@ -271,18 +437,51 @@ class NotionRepository implements OneEnvRepository {
     return records.map((record) => ({ ...record }))
   }
 
-  private invalidateListCache(): void {
-    this.cacheRevision += 1
-    this.listCache = null
+  private setLocalListCache(records: OneEnvRecord[]): void {
+    if (this.listCacheTtlMs <= 0) {
+      this.listCache = null
+      return
+    }
+
+    this.listCache = {
+      records,
+      expiresAt: Date.now() + this.listCacheTtlMs,
+    }
   }
 
-  private getCachedRecordByEntityId(entityId: string): OneEnvRecord | null {
-    const cache = this.listCache
-    if (!cache || cache.expiresAt <= Date.now()) {
+  private async invalidateListCache(): Promise<void> {
+    this.cacheRevision += 1
+    this.listCache = null
+    if (!this.listCacheStore) {
+      return
+    }
+
+    await this.listCacheStore.invalidateList(this.databaseId)
+  }
+
+  private async getCachedListFromStore(): Promise<OneEnvRecord[] | null> {
+    if (!this.listCacheStore || this.listCacheTtlMs <= 0) {
       return null
     }
 
-    return cache.records.find((record) => record.entityId === entityId) ?? null
+    return this.listCacheStore.getList(this.databaseId)
+  }
+
+  private async getCachedRecordByEntityId(
+    entityId: string,
+  ): Promise<OneEnvRecord | null> {
+    const cache = this.listCache
+    if (cache && cache.expiresAt > Date.now()) {
+      return cache.records.find((record) => record.entityId === entityId) ?? null
+    }
+
+    const sharedCachedList = await this.getCachedListFromStore()
+    if (!sharedCachedList) {
+      return null
+    }
+
+    this.setLocalListCache(sharedCachedList)
+    return sharedCachedList.find((record) => record.entityId === entityId) ?? null
   }
 
   private async queryPages(body: Record<string, unknown>): Promise<{
@@ -357,15 +556,25 @@ class NotionRepository implements OneEnvRepository {
 
     const revision = this.cacheRevision
     const promise = (async () => {
+      const sharedCachedList = await this.getCachedListFromStore()
+      if (sharedCachedList && revision === this.cacheRevision) {
+        this.setLocalListCache(sharedCachedList)
+        return sharedCachedList
+      }
+
       const pages = await this.fetchAllPages()
       const records = pages
         .map((page) => mapPageToRecord(page))
         .filter((record) => Boolean(record.entityId))
 
       if (revision === this.cacheRevision) {
-        this.listCache = {
-          records,
-          expiresAt: Date.now() + this.listCacheTtlMs,
+        this.setLocalListCache(records)
+        if (this.listCacheStore && this.listCacheTtlMs > 0) {
+          await this.listCacheStore.setList(
+            this.databaseId,
+            records,
+            this.listCacheTtlMs,
+          )
         }
       }
 
@@ -399,7 +608,7 @@ class NotionRepository implements OneEnvRepository {
       properties?: Record<string, unknown>
     }
 
-    this.invalidateListCache()
+    await this.invalidateListCache()
     return mapPageToRecord(json)
   }
 
@@ -407,7 +616,7 @@ class NotionRepository implements OneEnvRepository {
     entityId: string,
     patch: RecordPatch,
   ): Promise<OneEnvRecord | null> {
-    const cached = this.getCachedRecordByEntityId(entityId)
+    const cached = await this.getCachedRecordByEntityId(entityId)
     const targetPage = cached
       ? { id: cached.pageId }
       : await this.findPageByEntityId(entityId)
@@ -422,7 +631,7 @@ class NotionRepository implements OneEnvRepository {
     })
 
     const json = (await response.json()) as NotionPage
-    this.invalidateListCache()
+    await this.invalidateListCache()
     return mapPageToRecord(json)
   }
 }
@@ -438,7 +647,12 @@ export function getRepository(): OneEnvRepository {
   const databaseId = process.env.NOTION_DATABASE_ID
 
   if (token && databaseId) {
-    sharedRepository = new NotionRepository(token, databaseId)
+    sharedRepository = new NotionRepository(
+      token,
+      databaseId,
+      parseNotionListCacheTtlMs(process.env.NOTION_LIST_CACHE_TTL_MS),
+      getNotionListCacheStore(),
+    )
     return sharedRepository
   }
 
