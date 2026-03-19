@@ -5,6 +5,9 @@ const originalEnv = {
   notionToken: process.env.NOTION_API_TOKEN,
   notionDatabaseId: process.env.NOTION_DATABASE_ID,
   notionCacheTtl: process.env.NOTION_LIST_CACHE_TTL_MS,
+  oneenvRedisUrl: process.env.ONEENV_REDIS_URL,
+  redisUrl: process.env.REDIS_URL,
+  redisKeyPrefix: process.env.ONEENV_REDIS_KEY_PREFIX,
 }
 
 function setupNotionEnv(): void {
@@ -82,12 +85,18 @@ beforeEach(() => {
   delete process.env.NOTION_API_TOKEN
   delete process.env.NOTION_DATABASE_ID
   delete process.env.NOTION_LIST_CACHE_TTL_MS
+  delete process.env.ONEENV_REDIS_URL
+  delete process.env.REDIS_URL
+  delete process.env.ONEENV_REDIS_KEY_PREFIX
 })
 
 afterAll(() => {
   process.env.NOTION_API_TOKEN = originalEnv.notionToken
   process.env.NOTION_DATABASE_ID = originalEnv.notionDatabaseId
   process.env.NOTION_LIST_CACHE_TTL_MS = originalEnv.notionCacheTtl
+  process.env.ONEENV_REDIS_URL = originalEnv.oneenvRedisUrl
+  process.env.REDIS_URL = originalEnv.redisUrl
+  process.env.ONEENV_REDIS_KEY_PREFIX = originalEnv.redisKeyPrefix
 })
 
 describe('NotionRepository caching and update path', () => {

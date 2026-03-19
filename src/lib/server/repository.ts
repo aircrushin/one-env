@@ -25,7 +25,7 @@ type NotionListCacheStore = {
 type RedisClient = {
   connect: () => Promise<void>
   get: (key: string) => Promise<string | null>
-  set: (key: string, value: string, options?: { EX?: number }): Promise<unknown>
+  set: (key: string, value: string, options?: { EX?: number }) => Promise<unknown>
   del: (key: string) => Promise<number>
   on?: (event: string, listener: (...args: unknown[]) => void) => unknown
 }

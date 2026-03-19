@@ -42,6 +42,11 @@ NOTION_API_TOKEN=<notion integration token>
 NOTION_DATABASE_ID=<notion database id>
 # Optional performance tuning (default 5000ms):
 NOTION_LIST_CACHE_TTL_MS=5000
+# Optional shared cache for Notion list reads:
+# ONEENV_REDIS_URL has priority over REDIS_URL.
+ONEENV_REDIS_URL=redis://127.0.0.1:6379
+# Optional Redis key prefix (default oneenv):
+ONEENV_REDIS_KEY_PREFIX=oneenv
 ```
 
 Alternative for local quick testing:
@@ -116,3 +121,4 @@ NOTION_API_TOKEN=xxx NOTION_DATABASE_ID=xxx npm run notion:setup -- --check-only
 - Export precedence is fixed: environment variables override global variables with the same key.
 - Every create/update/delete/import/rollback writes a version event.
 - Current implementation stores values as plain text in Notion (accepted MVP tradeoff).
+- Redis cache is optional. If Redis is unreachable or `redis` package is missing, app falls back to in-memory cache automatically.
