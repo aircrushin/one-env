@@ -26,11 +26,12 @@
   --link-bg-hover: rgba(255, 255, 255, 0.9);
   --hero-a: rgba(79, 184, 178, 0.36);
   --hero-b: rgba(47, 106, 74, 0.2);
+  --field-placeholder: #54797e;
 }
 
 :root[data-theme="dark"] {
   --sea-ink: #d7ece8;
-  --sea-ink-soft: #afcdc8;
+  --sea-ink-soft: #c3ddd8;
   --lagoon: #60d7cf;
   --lagoon-deep: #8de5db;
   --palm: #6ec89a;
@@ -38,7 +39,7 @@
   --foam: #101d22;
   --surface: rgba(16, 30, 34, 0.8);
   --surface-strong: rgba(15, 27, 31, 0.92);
-  --line: rgba(141, 229, 219, 0.18);
+  --line: rgba(141, 229, 219, 0.24);
   --inset-glint: rgba(194, 247, 238, 0.14);
   --kicker: #b8efe5;
   --bg-base: #0a1418;
@@ -48,12 +49,13 @@
   --link-bg-hover: rgba(24, 44, 49, 0.8);
   --hero-a: rgba(96, 215, 207, 0.18);
   --hero-b: rgba(110, 200, 154, 0.12);
+  --field-placeholder: #99beb8;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
     --sea-ink: #d7ece8;
-    --sea-ink-soft: #afcdc8;
+    --sea-ink-soft: #c3ddd8;
     --lagoon: #60d7cf;
     --lagoon-deep: #8de5db;
     --palm: #6ec89a;
@@ -61,7 +63,7 @@
     --foam: #101d22;
     --surface: rgba(16, 30, 34, 0.8);
     --surface-strong: rgba(15, 27, 31, 0.92);
-    --line: rgba(141, 229, 219, 0.18);
+    --line: rgba(141, 229, 219, 0.24);
     --inset-glint: rgba(194, 247, 238, 0.14);
     --kicker: #b8efe5;
     --bg-base: #0a1418;
@@ -71,6 +73,7 @@
     --link-bg-hover: rgba(24, 44, 49, 0.8);
     --hero-a: rgba(96, 215, 207, 0.18);
     --hero-b: rgba(110, 200, 154, 0.12);
+    --field-placeholder: #99beb8;
   }
 }
 
@@ -171,6 +174,21 @@ pre code {
     0 22px 44px rgba(30, 90, 72, 0.1),
     0 6px 18px rgba(23, 58, 64, 0.08);
   backdrop-filter: blur(4px);
+}
+
+.island-shell :is(input, textarea, select) {
+  color: var(--sea-ink);
+  caret-color: var(--lagoon-deep);
+}
+
+.island-shell :is(input, textarea)::placeholder {
+  color: var(--field-placeholder);
+  opacity: 1;
+}
+
+.island-shell select option {
+  color: var(--sea-ink);
+  background: color-mix(in oklab, var(--surface-strong) 92%, var(--bg-base));
 }
 
 .feature-card {

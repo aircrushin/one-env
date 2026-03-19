@@ -1,10 +1,13 @@
 import { Link, useNavigate } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import { ApiError, apiRequest } from '#/lib/shared/api-client'
+import { useI18n } from '#/lib/i18n'
+import LanguageToggle from './LanguageToggle'
 import ThemeToggle from './ThemeToggle'
 
 export default function Header() {
   const navigate = useNavigate()
+  const { messages } = useI18n()
   const [authenticated, setAuthenticated] = useState(false)
 
   useEffect(() => {
@@ -60,14 +63,14 @@ export default function Header() {
             className="nav-link"
             activeProps={{ className: 'nav-link is-active' }}
           >
-            Home
+            {messages.header.home}
           </Link>
           <Link
             to="/projects"
             className="nav-link"
             activeProps={{ className: 'nav-link is-active' }}
           >
-            Projects
+            {messages.header.projects}
           </Link>
           {!authenticated ? (
             <Link
@@ -75,7 +78,7 @@ export default function Header() {
               className="nav-link"
               activeProps={{ className: 'nav-link is-active' }}
             >
-              Login
+              {messages.header.login}
             </Link>
           ) : null}
         </div>
@@ -87,9 +90,10 @@ export default function Header() {
               onClick={() => void handleLogout()}
               className="rounded-full border border-[var(--line)] bg-white/70 px-3 py-1.5 text-sm font-semibold text-[var(--sea-ink-soft)] transition hover:bg-white"
             >
-              Logout
+              {messages.header.logout}
             </button>
           ) : null}
+          <LanguageToggle />
           <ThemeToggle />
         </div>
       </nav>

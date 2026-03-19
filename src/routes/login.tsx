@@ -2,6 +2,7 @@ import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useEffect, useState } from 'react'
 import type { FormEvent } from 'react'
 import { ApiError, apiRequest } from '#/lib/shared/api-client'
+import { useI18n } from '#/lib/i18n'
 
 export const Route = createFileRoute('/login')({
   component: LoginPage,
@@ -9,6 +10,7 @@ export const Route = createFileRoute('/login')({
 
 function LoginPage() {
   const navigate = useNavigate()
+  const { messages } = useI18n()
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -48,7 +50,7 @@ function LoginPage() {
       if (submitError instanceof ApiError) {
         setError(submitError.message)
       } else {
-        setError('Login failed')
+        setError(messages.login.loginFailed)
       }
     } finally {
       setLoading(false)
@@ -59,14 +61,14 @@ function LoginPage() {
     <main className="page-wrap px-4 py-14">
       <section className="island-shell mx-auto w-full max-w-md rounded-3xl p-7 sm:p-9">
         <p className="island-kicker mb-2">oneenv</p>
-        <h1 className="display-title mb-3 text-4xl text-[var(--sea-ink)]">Admin Login</h1>
+        <h1 className="display-title mb-3 text-4xl text-[var(--sea-ink)]">{messages.login.title}</h1>
         <p className="mb-6 text-[var(--sea-ink-soft)]">
-          Use your admin password to access project and environment variables.
+          {messages.login.description}
         </p>
 
         <form className="space-y-4" onSubmit={onSubmit}>
           <label className="block text-sm font-semibold text-[var(--sea-ink)]" htmlFor="password">
-            Password
+            {messages.login.password}
           </label>
           <input
             id="password"
@@ -83,7 +85,7 @@ function LoginPage() {
             disabled={loading}
             className="w-full rounded-xl border border-[rgba(50,143,151,0.35)] bg-[rgba(79,184,178,0.2)] px-4 py-2.5 font-semibold text-[var(--lagoon-deep)] transition hover:bg-[rgba(79,184,178,0.3)] disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {loading ? 'Signing in...' : 'Sign in'}
+            {loading ? messages.login.signingIn : messages.login.signIn}
           </button>
         </form>
 

@@ -62,6 +62,30 @@ node -e "console.log(require('crypto').createHash('sha256').update('your-passwor
 npm run dev
 npm run build
 npm run test
+npm run notion:setup
+```
+
+### Bootstrap Notion Schema
+
+Use the helper script to avoid manually adding all Notion properties.
+The script auto-loads `.env` from the project root (shell env vars still take priority).
+
+Sync/fix an existing database schema:
+
+```bash
+NOTION_API_TOKEN=xxx NOTION_DATABASE_ID=xxx npm run notion:setup
+```
+
+Create a brand-new database under a parent page:
+
+```bash
+NOTION_API_TOKEN=xxx NOTION_PARENT_PAGE_ID=xxx npm run notion:setup -- --title oneenv
+```
+
+Check-only mode (no changes):
+
+```bash
+NOTION_API_TOKEN=xxx NOTION_DATABASE_ID=xxx npm run notion:setup -- --check-only
 ```
 
 ## API Surface (MVP)

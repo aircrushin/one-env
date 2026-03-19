@@ -1,9 +1,13 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import { useEffect, useMemo, useState } from 'react'
-import type { FormEvent } from 'react'
+import type { ChangeEvent, DragEvent, FormEvent } from 'react'
 import { ApiError, apiRequest } from '#/lib/shared/api-client'
+import { parseEnvContent, serializeEnvEntries } from '#/lib/shared/env'
+import { useI18n } from '#/lib/i18n'
+import type { Messages } from '#/lib/i18n'
 import type {
   Environment,
+  ParsedEnvEntry,
   Project,
   SearchResult,
   Variable,
@@ -13,6 +17,7 @@ import type {
 
 type ListResponse<T> = { items: T[] }
 type ExportResponse = { content: string; items: Variable[] }
+type ImportResponse = { created: number; updated: number; skipped: number; total: number }
 
 type VariableDraft = {
   key: string
@@ -27,6 +32,7 @@ export const Route = createFileRoute('/projects/$projectId')({
 function ProjectDetailPage() {
   const { projectId } = Route.useParams()
   const navigate = useNavigate()
+  const { language, messages } = useI18n()
 
   const [project, setProject] = useState<Project | null>(null)
   const [environments, setEnvironments] = useState<Environment[]>([])
@@ -52,13 +58,17 @@ function ProjectDetailPage() {
 
   const [importScope, setImportScope] = useState<VariableScope>('env')
   const [importText, setImportText] = useState('')
+  const [importFileName, setImportFileName] = useState('')
+  const [isImportDragOver, setIsImportDragOver] = useState(false)
   const [exportText, setExportText] = useState('')
+  const [exportProgress, setExportProgress] = useState<number | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<SearchResult[]>([])
 
   const [loading, setLoading] = useState(true)
   const [busyMessage, setBusyMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [toastMessage, setToastMessage] = useState<string | null>(null)
 
   const selectedEnvironment = useMemo(
     () => environments.find((item) => item.id === selectedEnvironmentId) ?? null,
@@ -77,6 +87,21 @@ function ProjectDetailPage() {
       ),
     [variables, selectedEnvironmentId],
   )
+
+  const parsedImportEntries = useMemo(
+    () => parseEnvContent(importText),
+    [importText],
+  )
+
+  const mergedImportEntries = useMemo(() => {
+    const byKey = new Map<string, ParsedEnvEntry>()
+    for (const entry of parsedImportEntries) {
+      byKey.set(entry.key, entry)
+    }
+    return Array.from(byKey.values())
+  }, [parsedImportEntries])
+
+  const duplicateImportCount = parsedImportEntries.length - mergedImportEntries.length
 
   useEffect(() => {
     let active = true
@@ -117,7 +142,9 @@ function ProjectDetailPage() {
           return
         }
 
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load project')
+        setError(
+          loadError instanceof Error ? loadError.message : messages.projectDetail.failedToLoadProject,
+        )
       } finally {
         if (active) {
           setLoading(false)
@@ -169,7 +196,9 @@ function ProjectDetailPage() {
           return
         }
 
-        setError(loadError instanceof Error ? loadError.message : 'Failed to load variables')
+        setError(
+          loadError instanceof Error ? loadError.message : messages.projectDetail.failedToLoadVariables,
+        )
       }
     }
 
@@ -179,6 +208,20 @@ function ProjectDetailPage() {
       active = false
     }
   }, [navigate, projectId, selectedEnvironmentId])
+
+  useEffect(() => {
+    if (!toastMessage) {
+      return
+    }
+
+    const timeoutId = setTimeout(() => {
+      setToastMessage(null)
+    }, 3000)
+
+    return () => {
+      clearTimeout(timeoutId)
+    }
+  }, [toastMessage])
 
   async function withBusy(message: string, action: () => Promise<void>): Promise<void> {
     setBusyMessage(message)
@@ -190,7 +233,7 @@ function ProjectDetailPage() {
         navigate({ to: '/login' })
         return
       }
-      setError(actionError instanceof Error ? actionError.message : 'Operation failed')
+      setError(actionError instanceof Error ? actionError.message : messages.projectDetail.operationFailed)
     } finally {
       setBusyMessage(null)
     }
@@ -218,7 +261,7 @@ function ProjectDetailPage() {
 
   async function handleCreateEnvironment(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
-    await withBusy('Creating environment...', async () => {
+    await withBusy(messages.projectDetail.creatingEnvironment, async () => {
       const created = await apiRequest<Environment>(
         `/api/v1/projects/${projectId}/environments`,
         {
@@ -239,9 +282,9 @@ function ProjectDetailPage() {
   async function handleCreateVariable(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
 
-    await withBusy('Creating variable...', async () => {
+    await withBusy(messages.projectDetail.creatingVariable, async () => {
       if (variableScope === 'env' && !selectedEnvironmentId) {
-        throw new Error('Select an environment before creating env-scoped variables')
+        throw new Error(messages.projectDetail.selectEnvBeforeCreateScopedVariable)
       }
 
       await apiRequest<Variable>('/api/v1/variables', {
@@ -263,7 +306,7 @@ function ProjectDetailPage() {
   }
 
   async function handleDeleteVariable(variableId: string): Promise<void> {
-    await withBusy('Deleting variable...', async () => {
+    await withBusy(messages.projectDetail.deletingVariable, async () => {
       await apiRequest<{ success: boolean }>(`/api/v1/variables/${variableId}`, {
         method: 'DELETE',
       })
@@ -272,7 +315,7 @@ function ProjectDetailPage() {
   }
 
   async function handleSaveEdit(variableId: string): Promise<void> {
-    await withBusy('Updating variable...', async () => {
+    await withBusy(messages.projectDetail.updatingVariable, async () => {
       await apiRequest<Variable>(`/api/v1/variables/${variableId}`, {
         method: 'PATCH',
         body: JSON.stringify(editingDraft),
@@ -291,33 +334,103 @@ function ProjectDetailPage() {
     })
   }
 
+  async function loadImportFile(file: File): Promise<void> {
+    try {
+      const content = await file.text()
+      setImportText(content)
+      setImportFileName(file.name)
+      setError(null)
+    } catch {
+      setError(messages.projectDetail.failedToReadEnvFile)
+    }
+  }
+
+  function handleImportFileSelect(event: ChangeEvent<HTMLInputElement>): void {
+    const selected = event.target.files?.[0]
+    if (!selected) {
+      return
+    }
+
+    void loadImportFile(selected)
+    event.target.value = ''
+  }
+
+  function handleImportDragOver(event: DragEvent<HTMLDivElement>): void {
+    event.preventDefault()
+    setIsImportDragOver(true)
+  }
+
+  function handleImportDragLeave(event: DragEvent<HTMLDivElement>): void {
+    event.preventDefault()
+    setIsImportDragOver(false)
+  }
+
+  function handleImportDrop(event: DragEvent<HTMLDivElement>): void {
+    event.preventDefault()
+    setIsImportDragOver(false)
+
+    const dropped = event.dataTransfer.files?.[0]
+    if (!dropped) {
+      return
+    }
+
+    void loadImportFile(dropped)
+  }
+
   async function handleImport(): Promise<void> {
-    await withBusy('Importing .env...', async () => {
+    await withBusy(messages.projectDetail.importingEnv, async () => {
       if (importScope === 'env' && !selectedEnvironmentId) {
-        throw new Error('Select an environment before importing env-scoped variables')
+        throw new Error(messages.projectDetail.selectEnvBeforeImportScopedVariables)
+      }
+      if (mergedImportEntries.length === 0) {
+        throw new Error(messages.projectDetail.pasteOrDropEnvFile)
       }
 
-      await apiRequest<{ created: number; updated: number; skipped: number; total: number }>(
+      const result = await apiRequest<ImportResponse>(
         '/api/v1/env/import',
         {
           method: 'POST',
           body: JSON.stringify({
             scope: importScope,
-            content: importText,
+            content: serializeEnvEntries(mergedImportEntries),
             projectId: importScope === 'env' ? projectId : undefined,
             environmentId: importScope === 'env' ? selectedEnvironmentId : undefined,
           }),
         },
       )
 
+      setImportText('')
+      setImportFileName('')
+      setToastMessage(
+        messages.projectDetail.importCompleted(
+          result.created,
+          result.updated,
+          result.skipped,
+          result.total,
+        ),
+      )
       await refreshSelectedEnvironmentData()
     })
   }
 
   async function handleExport(): Promise<void> {
-    await withBusy('Exporting .env...', async () => {
+    setExportProgress(12)
+    const intervalId = window.setInterval(() => {
+      setExportProgress((current) => {
+        if (current === null) {
+          return 12
+        }
+        if (current >= 92) {
+          return current
+        }
+        return Math.min(92, current + Math.max(1, Math.round((92 - current) / 4)))
+      })
+    }, 180)
+
+    let succeeded = false
+    await withBusy(messages.projectDetail.exportingEnv, async () => {
       if (!selectedEnvironmentId) {
-        throw new Error('Select an environment before export')
+        throw new Error(messages.projectDetail.selectEnvBeforeExport)
       }
 
       const exported = await apiRequest<ExportResponse>(
@@ -325,13 +438,26 @@ function ProjectDetailPage() {
       )
 
       setExportText(exported.content)
+      succeeded = true
     })
+
+    window.clearInterval(intervalId)
+
+    if (!succeeded) {
+      setExportProgress(null)
+      return
+    }
+
+    setExportProgress(100)
+    window.setTimeout(() => {
+      setExportProgress(null)
+    }, 500)
   }
 
   async function handleSearch(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault()
 
-    await withBusy('Searching...', async () => {
+    await withBusy(messages.projectDetail.searching, async () => {
       const query = encodeURIComponent(searchQuery)
       const project = encodeURIComponent(projectId)
       const env = encodeURIComponent(selectedEnvironmentId)
@@ -345,7 +471,7 @@ function ProjectDetailPage() {
   }
 
   async function handleRollback(versionEventId: string): Promise<void> {
-    await withBusy('Rolling back version...', async () => {
+    await withBusy(messages.projectDetail.rollbackVersion, async () => {
       await apiRequest<{ variable: Variable | null }>(
         `/api/v1/versions/${versionEventId}/rollback`,
         {
@@ -362,14 +488,14 @@ function ProjectDetailPage() {
       <section className="island-shell rounded-3xl px-6 py-6 sm:px-8">
         <p className="island-kicker mb-2">oneenv</p>
         <h1 className="display-title m-0 text-4xl text-[var(--sea-ink)] sm:text-5xl">
-          {project?.name ?? 'Project'}
+          {project?.name ?? messages.projectDetail.fallbackProjectName}
         </h1>
         <p className="mt-3 text-[var(--sea-ink-soft)]">
-          {project?.description || 'Manage environments, shared variables, imports, and version history.'}
+          {project?.description || messages.projectDetail.fallbackProjectDescription}
         </p>
       </section>
 
-      {loading ? <p className="text-[var(--sea-ink-soft)]">Loading project details...</p> : null}
+      {loading ? <p className="text-[var(--sea-ink-soft)]">{messages.projectDetail.loadingProjectDetails}</p> : null}
 
       {error ? (
         <p className="rounded-lg border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-700">
@@ -385,7 +511,7 @@ function ProjectDetailPage() {
 
       <section className="grid gap-6 lg:grid-cols-[280px_1fr]">
         <aside className="island-shell rounded-2xl p-5">
-          <h2 className="m-0 text-lg font-semibold text-[var(--sea-ink)]">Environments</h2>
+          <h2 className="m-0 text-lg font-semibold text-[var(--sea-ink)]">{messages.projectDetail.environments}</h2>
           <ul className="mt-4 space-y-2 p-0">
             {environments.map((environment) => (
               <li key={environment.id} className="list-none">
@@ -395,7 +521,7 @@ function ProjectDetailPage() {
                   className={`w-full rounded-lg border px-3 py-2 text-left text-sm transition ${
                     selectedEnvironmentId === environment.id
                       ? 'border-[rgba(50,143,151,0.4)] bg-[rgba(79,184,178,0.2)] text-[var(--sea-ink)]'
-                      : 'border-[var(--line)] bg-white/70 text-[var(--sea-ink-soft)] hover:border-[rgba(50,143,151,0.3)]'
+                      : 'border-[var(--line)] bg-[var(--surface)] text-[var(--sea-ink-soft)] hover:border-[rgba(50,143,151,0.3)]'
                   }`}
                 >
                   {environment.name}
@@ -406,163 +532,258 @@ function ProjectDetailPage() {
 
           <form className="mt-5 space-y-2" onSubmit={handleCreateEnvironment}>
             <input
-              placeholder="Environment name"
+              placeholder={messages.projectDetail.environmentNamePlaceholder}
               value={envName}
               onChange={(event) => setEnvName(event.target.value)}
-              className="w-full rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
+              className="w-full rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
               required
             />
             <textarea
-              placeholder="Description"
+              placeholder={messages.projectDetail.environmentDescriptionPlaceholder}
               value={envDescription}
               onChange={(event) => setEnvDescription(event.target.value)}
-              className="min-h-20 w-full rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
+              className="min-h-20 w-full rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
             />
             <button
               type="submit"
               className="w-full rounded-lg border border-[rgba(50,143,151,0.35)] bg-[rgba(79,184,178,0.2)] px-3 py-2 text-sm font-semibold text-[var(--lagoon-deep)] transition hover:bg-[rgba(79,184,178,0.3)]"
             >
-              Add Environment
+              {messages.projectDetail.addEnvironment}
             </button>
           </form>
         </aside>
 
         <div className="space-y-6">
           <section className="island-shell rounded-2xl p-5">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <h2 className="m-0 text-lg font-semibold text-[var(--sea-ink)]">
-                Variables ({selectedEnvironment?.name ?? 'No environment selected'})
-              </h2>
-              <select
-                value={variableScope}
-                onChange={(event) => setVariableScope(event.target.value as VariableScope)}
-                className="rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)]"
-              >
-                <option value="env">Environment scope</option>
-                <option value="global">Global scope</option>
-              </select>
-            </div>
-
-            <form className="mt-4 grid gap-3 md:grid-cols-3" onSubmit={handleCreateVariable}>
-              <input
-                placeholder="KEY"
-                value={variableDraft.key}
-                onChange={(event) =>
-                  setVariableDraft((current) => ({ ...current, key: event.target.value }))
-                }
-                className="rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
-                required
-              />
-              <input
-                placeholder="value"
-                value={variableDraft.value}
-                onChange={(event) =>
-                  setVariableDraft((current) => ({ ...current, value: event.target.value }))
-                }
-                className="rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
-                required
-              />
-              <input
-                placeholder="description"
-                value={variableDraft.description}
-                onChange={(event) =>
-                  setVariableDraft((current) => ({
-                    ...current,
-                    description: event.target.value,
-                  }))
-                }
-                className="rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
-              />
-              <button
-                type="submit"
-                className="md:col-span-3 rounded-lg border border-[rgba(50,143,151,0.35)] bg-[rgba(79,184,178,0.2)] px-3 py-2 text-sm font-semibold text-[var(--lagoon-deep)] transition hover:bg-[rgba(79,184,178,0.3)]"
-              >
-                Add Variable
-              </button>
-            </form>
-
-            <div className="mt-5 grid gap-4 xl:grid-cols-2">
-              <VariableList
-                title="Global Variables"
-                variables={globalVariables}
-                editingVariableId={editingVariableId}
-                editingDraft={editingDraft}
-                onStartEdit={startEdit}
-                onEditingDraftChange={setEditingDraft}
-                onSaveEdit={handleSaveEdit}
-                onDelete={handleDeleteVariable}
-                onCancelEdit={() => setEditingVariableId('')}
-              />
-              <VariableList
-                title="Environment Variables"
-                variables={envVariables}
-                editingVariableId={editingVariableId}
-                editingDraft={editingDraft}
-                onStartEdit={startEdit}
-                onEditingDraftChange={setEditingDraft}
-                onSaveEdit={handleSaveEdit}
-                onDelete={handleDeleteVariable}
-                onCancelEdit={() => setEditingVariableId('')}
-              />
-            </div>
-          </section>
-
-          <section className="island-shell rounded-2xl p-5">
-            <h2 className="m-0 text-lg font-semibold text-[var(--sea-ink)]">Import / Export</h2>
+            <h2 className="m-0 text-lg font-semibold text-[var(--sea-ink)]">{messages.projectDetail.importExport}</h2>
             <div className="mt-3 flex flex-wrap gap-2">
               <select
                 value={importScope}
                 onChange={(event) => setImportScope(event.target.value as VariableScope)}
-                className="rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)]"
+                className="rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)]"
               >
-                <option value="env">Import to selected environment</option>
-                <option value="global">Import to global scope</option>
+                <option value="env">{messages.projectDetail.importToSelectedEnvironment}</option>
+                <option value="global">{messages.projectDetail.importToGlobalScope}</option>
               </select>
               <button
                 type="button"
                 onClick={() => void handleImport()}
+                disabled={mergedImportEntries.length === 0}
                 className="rounded-lg border border-[rgba(50,143,151,0.35)] bg-[rgba(79,184,178,0.2)] px-3 py-2 text-sm font-semibold text-[var(--lagoon-deep)] transition hover:bg-[rgba(79,184,178,0.3)]"
               >
-                Import .env
+                {messages.projectDetail.confirmImport}
               </button>
               <button
                 type="button"
                 onClick={() => void handleExport()}
-                className="rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm font-semibold text-[var(--sea-ink-soft)] transition hover:bg-white"
+                disabled={exportProgress !== null}
+                className="rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm font-semibold text-[var(--sea-ink)] transition hover:bg-[var(--surface)] disabled:cursor-not-allowed disabled:opacity-60"
               >
-                Export merged .env
+                {messages.projectDetail.exportMergedEnv}
               </button>
+            </div>
+
+            {exportProgress !== null ? (
+              <div className="mt-3 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2">
+                <div className="flex items-center justify-between text-xs text-[var(--sea-ink-soft)]">
+                  <span>{messages.projectDetail.exportingEnv}</span>
+                  <span>{exportProgress}%</span>
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-[var(--surface-strong)]">
+                  <div
+                    className="h-full rounded-full bg-[var(--lagoon)] transition-all duration-200"
+                    role="progressbar"
+                    aria-label={messages.projectDetail.exportingEnv}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={exportProgress}
+                    style={{ width: `${exportProgress}%` }}
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            <div
+              onDragOver={handleImportDragOver}
+              onDragLeave={handleImportDragLeave}
+              onDrop={handleImportDrop}
+              className={`mt-3 rounded-lg border-2 border-dashed px-3 py-3 text-sm ${
+                isImportDragOver
+                  ? 'border-[rgba(50,143,151,0.5)] bg-[rgba(79,184,178,0.14)]'
+                  : 'border-[var(--line)] bg-[var(--surface)]'
+              }`}
+            >
+              <p className="m-0 text-[var(--sea-ink)]">
+                {messages.projectDetail.pasteOrDropHint}
+              </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <label className="inline-flex cursor-pointer rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-1.5 text-xs font-semibold text-[var(--sea-ink)] transition hover:bg-[var(--surface)]">
+                  {messages.projectDetail.chooseEnvFile}
+                  <input
+                    type="file"
+                    accept=".env,.txt,text/plain"
+                    onChange={handleImportFileSelect}
+                    className="hidden"
+                  />
+                </label>
+                <p className="m-0 text-xs text-[var(--sea-ink-soft)]">
+                  {importFileName
+                    ? messages.projectDetail.loadedFile(importFileName)
+                    : messages.projectDetail.noFileSelected}
+                </p>
+              </div>
             </div>
 
             <textarea
               value={importText}
-              onChange={(event) => setImportText(event.target.value)}
-              placeholder="Paste .env content here"
-              className="mt-3 min-h-32 w-full rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
+              onChange={(event) => {
+                setImportText(event.target.value)
+                setImportFileName('')
+              }}
+              placeholder={messages.projectDetail.importContentPlaceholder}
+              className="mt-3 min-h-32 w-full rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
             />
 
-            <textarea
-              value={exportText}
-              onChange={(event) => setExportText(event.target.value)}
-              placeholder="Export result"
-              className="mt-3 min-h-32 w-full rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 font-mono text-xs text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
-            />
+            <div className="mt-3 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2 text-xs text-[var(--sea-ink-soft)]">
+              <p className="m-0">
+                {messages.projectDetail.parsedVariablesSummary(
+                  mergedImportEntries.length,
+                  duplicateImportCount,
+                )}
+              </p>
+              {importText.trim() && mergedImportEntries.length === 0 ? (
+                <p className="m-0 mt-1 text-red-700">
+                  {messages.projectDetail.noValidEntries}
+                </p>
+              ) : null}
+              {mergedImportEntries.length > 0 ? (
+                <ul className="mt-2 space-y-1 p-0">
+                  {mergedImportEntries.slice(0, 8).map((entry) => (
+                    <li key={entry.key} className="list-none font-mono text-[11px] text-[var(--sea-ink)]">
+                      {entry.key}={entry.value}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {mergedImportEntries.length > 8 ? (
+                <p className="m-0 mt-1">
+                  {messages.projectDetail.andMore(mergedImportEntries.length - 8)}
+                </p>
+              ) : null}
+            </div>
+
+            {exportText ? (
+              <textarea
+                value={exportText}
+                onChange={(event) => setExportText(event.target.value)}
+                placeholder={messages.projectDetail.exportResultPlaceholder}
+                className="mt-3 min-h-32 w-full rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 font-mono text-xs text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
+              />
+            ) : null}
           </section>
 
           <section className="island-shell rounded-2xl p-5">
-            <h2 className="m-0 text-lg font-semibold text-[var(--sea-ink)]">Search</h2>
+            <details>
+              <summary className="cursor-pointer text-lg font-semibold text-[var(--sea-ink)]">
+                {messages.projectDetail.variablesTitle(
+                  selectedEnvironment?.name ?? messages.projectDetail.noEnvironmentSelected,
+                )}
+              </summary>
+
+              <div className="mt-4">
+                <div className="flex flex-wrap items-center justify-end gap-3">
+                  <select
+                    value={variableScope}
+                    onChange={(event) => setVariableScope(event.target.value as VariableScope)}
+                    className="rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)]"
+                  >
+                    <option value="env">{messages.projectDetail.environmentScope}</option>
+                    <option value="global">{messages.projectDetail.globalScope}</option>
+                  </select>
+                </div>
+
+                <form className="mt-4 grid gap-3 md:grid-cols-3" onSubmit={handleCreateVariable}>
+                  <input
+                    placeholder={messages.projectDetail.keyPlaceholder}
+                    value={variableDraft.key}
+                    onChange={(event) =>
+                      setVariableDraft((current) => ({ ...current, key: event.target.value }))
+                    }
+                    className="rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
+                    required
+                  />
+                  <input
+                    placeholder={messages.projectDetail.valuePlaceholder}
+                    value={variableDraft.value}
+                    onChange={(event) =>
+                      setVariableDraft((current) => ({ ...current, value: event.target.value }))
+                    }
+                    className="rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
+                    required
+                  />
+                  <input
+                    placeholder={messages.projectDetail.variableDescriptionPlaceholder}
+                    value={variableDraft.description}
+                    onChange={(event) =>
+                      setVariableDraft((current) => ({
+                        ...current,
+                        description: event.target.value,
+                      }))
+                    }
+                    className="rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
+                  />
+                  <button
+                    type="submit"
+                    className="md:col-span-3 rounded-lg border border-[rgba(50,143,151,0.35)] bg-[rgba(79,184,178,0.2)] px-3 py-2 text-sm font-semibold text-[var(--lagoon-deep)] transition hover:bg-[rgba(79,184,178,0.3)]"
+                  >
+                    {messages.projectDetail.addVariable}
+                  </button>
+                </form>
+
+                <div className="mt-5 grid gap-4 xl:grid-cols-2">
+                  <VariableList
+                    title={messages.projectDetail.globalVariables}
+                    variables={globalVariables}
+                    editingVariableId={editingVariableId}
+                    editingDraft={editingDraft}
+                    onStartEdit={startEdit}
+                    onEditingDraftChange={setEditingDraft}
+                    onSaveEdit={handleSaveEdit}
+                    onDelete={handleDeleteVariable}
+                    onCancelEdit={() => setEditingVariableId('')}
+                    messages={messages.variableList}
+                  />
+                  <VariableList
+                    title={messages.projectDetail.environmentVariables}
+                    variables={envVariables}
+                    editingVariableId={editingVariableId}
+                    editingDraft={editingDraft}
+                    onStartEdit={startEdit}
+                    onEditingDraftChange={setEditingDraft}
+                    onSaveEdit={handleSaveEdit}
+                    onDelete={handleDeleteVariable}
+                    onCancelEdit={() => setEditingVariableId('')}
+                    messages={messages.variableList}
+                  />
+                </div>
+              </div>
+            </details>
+          </section>
+
+          <section className="island-shell rounded-2xl p-5">
+            <h2 className="m-0 text-lg font-semibold text-[var(--sea-ink)]">{messages.projectDetail.search}</h2>
             <form className="mt-3 flex flex-wrap gap-2" onSubmit={handleSearch}>
               <input
                 value={searchQuery}
                 onChange={(event) => setSearchQuery(event.target.value)}
-                placeholder="Search key / value / description"
-                className="min-w-64 flex-1 rounded-lg border border-[var(--line)] bg-white/80 px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
+                placeholder={messages.projectDetail.searchPlaceholder}
+                className="min-w-64 flex-1 rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-3 py-2 text-sm text-[var(--sea-ink)] outline-none ring-[var(--lagoon)] focus:ring-2"
               />
               <button
                 type="submit"
                 className="rounded-lg border border-[rgba(50,143,151,0.35)] bg-[rgba(79,184,178,0.2)] px-3 py-2 text-sm font-semibold text-[var(--lagoon-deep)] transition hover:bg-[rgba(79,184,178,0.3)]"
               >
-                Search
+                {messages.projectDetail.searchButton}
               </button>
             </form>
 
@@ -570,7 +791,7 @@ function ProjectDetailPage() {
               {searchResults.map((result) => (
                 <li
                   key={result.id}
-                  className="list-none rounded-lg border border-[var(--line)] bg-white/70 px-3 py-2 text-sm"
+                  className="list-none rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-2 text-sm"
                 >
                   <p className="m-0 font-semibold text-[var(--sea-ink)]">
                     {result.key}{' '}
@@ -585,40 +806,55 @@ function ProjectDetailPage() {
           </section>
 
           <section className="island-shell rounded-2xl p-5">
-            <h2 className="m-0 text-lg font-semibold text-[var(--sea-ink)]">Version History</h2>
-            <ul className="mt-3 space-y-3 p-0">
-              {versions.slice(0, 30).map((version) => (
-                <li
-                  key={version.id}
-                  className="list-none rounded-lg border border-[var(--line)] bg-white/75 px-3 py-3"
-                >
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="m-0 text-sm font-semibold text-[var(--sea-ink)]">
-                      {version.eventType} - {version.key}
+            <details>
+              <summary className="cursor-pointer text-lg font-semibold text-[var(--sea-ink)]">
+                {messages.projectDetail.versionHistory}
+              </summary>
+
+              <ul className="mt-3 space-y-3 p-0">
+                {versions.slice(0, 30).map((version) => (
+                  <li
+                    key={version.id}
+                    className="list-none rounded-lg border border-[var(--line)] bg-[var(--surface)] px-3 py-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <p className="m-0 text-sm font-semibold text-[var(--sea-ink)]">
+                        {version.eventType} - {version.key}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void handleRollback(version.id)}
+                        className="rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] px-2.5 py-1 text-xs font-semibold text-[var(--sea-ink)] transition hover:bg-[rgba(79,184,178,0.18)]"
+                      >
+                        {messages.projectDetail.rollback}
+                      </button>
+                    </div>
+                    <p className="m-0 mt-1 text-xs text-[var(--sea-ink-soft)]">
+                      {new Date(version.createdAtIso).toLocaleString(language === 'zh' ? 'zh-CN' : 'en-US')}
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => void handleRollback(version.id)}
-                      className="rounded-lg border border-[var(--line)] bg-white px-2.5 py-1 text-xs font-semibold text-[var(--sea-ink-soft)] transition hover:bg-[rgba(79,184,178,0.18)]"
-                    >
-                      Rollback
-                    </button>
-                  </div>
-                  <p className="m-0 mt-1 text-xs text-[var(--sea-ink-soft)]">
-                    {new Date(version.createdAtIso).toLocaleString()}
-                  </p>
-                  <details className="mt-2 text-xs text-[var(--sea-ink-soft)]">
-                    <summary>Snapshot JSON</summary>
-                    <pre className="mt-2 overflow-auto rounded-md border border-[var(--line)] bg-[var(--surface)] p-2">
-                      <code>{version.snapshotJson}</code>
-                    </pre>
-                  </details>
-                </li>
-              ))}
-            </ul>
+                    <details className="mt-2 text-xs text-[var(--sea-ink-soft)]">
+                      <summary>{messages.projectDetail.snapshotJson}</summary>
+                      <pre className="mt-2 overflow-auto rounded-md border border-[var(--line)] bg-[var(--surface)] p-2">
+                        <code>{version.snapshotJson}</code>
+                      </pre>
+                    </details>
+                  </li>
+                ))}
+              </ul>
+            </details>
           </section>
         </div>
       </section>
+
+      {toastMessage ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed right-4 bottom-4 z-50 max-w-md rounded-lg border border-[rgba(50,143,151,0.35)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--sea-ink)] shadow-lg"
+        >
+          {toastMessage}
+        </div>
+      ) : null}
     </main>
   )
 }
@@ -633,11 +869,12 @@ type VariableListProps = {
   onSaveEdit: (id: string) => Promise<void>
   onDelete: (id: string) => Promise<void>
   onCancelEdit: () => void
+  messages: Messages['variableList']
 }
 
 function VariableList(props: VariableListProps) {
   return (
-    <article className="rounded-xl border border-[var(--line)] bg-white/65 p-3">
+    <article className="rounded-xl border border-[var(--line)] bg-[var(--surface)] p-3">
       <h3 className="m-0 text-sm font-semibold text-[var(--sea-ink)]">{props.title}</h3>
       <ul className="mt-3 space-y-2 p-0">
         {props.variables.map((variable) => {
@@ -647,7 +884,7 @@ function VariableList(props: VariableListProps) {
             return (
               <li
                 key={variable.id}
-                className="list-none rounded-lg border border-[var(--line)] bg-white p-2"
+                className="list-none rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] p-2"
               >
                 <input
                   value={props.editingDraft.key}
@@ -685,14 +922,14 @@ function VariableList(props: VariableListProps) {
                     onClick={() => void props.onSaveEdit(variable.id)}
                     className="rounded border border-[rgba(50,143,151,0.35)] bg-[rgba(79,184,178,0.2)] px-2 py-1 text-xs"
                   >
-                    Save
+                    {props.messages.save}
                   </button>
                   <button
                     type="button"
                     onClick={props.onCancelEdit}
-                    className="rounded border border-[var(--line)] bg-white px-2 py-1 text-xs"
+                    className="rounded border border-[var(--line)] bg-[var(--surface)] px-2 py-1 text-xs"
                   >
-                    Cancel
+                    {props.messages.cancel}
                   </button>
                 </div>
               </li>
@@ -702,28 +939,31 @@ function VariableList(props: VariableListProps) {
           return (
             <li
               key={variable.id}
-              className="list-none rounded-lg border border-[var(--line)] bg-white/90 p-2"
+              className="list-none rounded-lg border border-[var(--line)] bg-[var(--surface-strong)] p-2"
             >
               <p className="m-0 text-sm font-semibold text-[var(--sea-ink)]">{variable.key}</p>
               <p className="m-0 mt-1 text-sm text-[var(--sea-ink-soft)]">{variable.value}</p>
               {variable.description ? (
                 <p className="m-0 mt-1 text-xs text-[var(--sea-ink-soft)]">{variable.description}</p>
               ) : null}
-              <p className="m-0 mt-1 text-xs text-[var(--sea-ink-soft)]">v{variable.versionNo}</p>
+              <p className="m-0 mt-1 text-xs text-[var(--sea-ink-soft)]">
+                {props.messages.versionPrefix}
+                {variable.versionNo}
+              </p>
               <div className="mt-2 flex gap-2">
                 <button
                   type="button"
                   onClick={() => props.onStartEdit(variable)}
-                  className="rounded border border-[var(--line)] bg-white px-2 py-1 text-xs"
+                  className="rounded border border-[var(--line)] bg-[var(--surface)] px-2 py-1 text-xs"
                 >
-                  Edit
+                  {props.messages.edit}
                 </button>
                 <button
                   type="button"
                   onClick={() => void props.onDelete(variable.id)}
                   className="rounded border border-red-300 bg-red-50 px-2 py-1 text-xs text-red-700"
                 >
-                  Delete
+                  {props.messages.delete}
                 </button>
               </div>
             </li>
