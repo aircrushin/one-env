@@ -40,6 +40,8 @@ ONEENV_SESSION_SECRET=<long-random-secret>
 # Optional but recommended for production:
 NOTION_API_TOKEN=<notion integration token>
 NOTION_DATABASE_ID=<notion database id>
+# Optional performance tuning (default 5000ms):
+NOTION_LIST_CACHE_TTL_MS=5000
 ```
 
 Alternative for local quick testing:

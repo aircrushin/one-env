@@ -8,6 +8,13 @@ import type {
 
 type RecordPatch = Partial<Omit<OneEnvRecord, 'pageId' | 'entityId'>>
 
+const DEFAULT_NOTION_LIST_CACHE_TTL_MS = 5_000
+
+type NotionPage = {
+  id: string
+  properties?: Record<string, unknown>
+}
+
 export interface OneEnvRepository {
   list(): Promise<OneEnvRecord[]>
   create(record: Omit<OneEnvRecord, 'pageId'>): Promise<OneEnvRecord>
@@ -209,10 +216,36 @@ function mapPageToRecord(page: {
   }
 }
 
+function parseNotionListCacheTtlMs(rawValue: string | undefined): number {
+  if (!rawValue) {
+    return DEFAULT_NOTION_LIST_CACHE_TTL_MS
+  }
+
+  const parsed = Number.parseInt(rawValue, 10)
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_NOTION_LIST_CACHE_TTL_MS
+  }
+
+  return parsed
+}
+
 class NotionRepository implements OneEnvRepository {
+  private listCache: {
+    records: OneEnvRecord[]
+    expiresAt: number
+  } | null = null
+  private listInFlight: {
+    revision: number
+    promise: Promise<OneEnvRecord[]>
+  } | null = null
+  private cacheRevision = 0
+
   constructor(
     private readonly token: string,
     private readonly databaseId: string,
+    private readonly listCacheTtlMs = parseNotionListCacheTtlMs(
+      process.env.NOTION_LIST_CACHE_TTL_MS,
+    ),
   ) {}
 
   private async notionFetch(path: string, init?: RequestInit): Promise<Response> {
@@ -234,8 +267,52 @@ class NotionRepository implements OneEnvRepository {
     return response
   }
 
-  async list(): Promise<OneEnvRecord[]> {
-    const pages: Array<{ id: string; properties?: Record<string, unknown> }> = []
+  private cloneRecords(records: OneEnvRecord[]): OneEnvRecord[] {
+    return records.map((record) => ({ ...record }))
+  }
+
+  private invalidateListCache(): void {
+    this.cacheRevision += 1
+    this.listCache = null
+  }
+
+  private getCachedRecordByEntityId(entityId: string): OneEnvRecord | null {
+    const cache = this.listCache
+    if (!cache || cache.expiresAt <= Date.now()) {
+      return null
+    }
+
+    return cache.records.find((record) => record.entityId === entityId) ?? null
+  }
+
+  private async queryPages(body: Record<string, unknown>): Promise<{
+    results: NotionPage[]
+    hasMore: boolean
+    nextCursor?: string
+  }> {
+    const response = await this.notionFetch(
+      `/databases/${this.databaseId}/query`,
+      {
+        method: 'POST',
+        body: JSON.stringify(body),
+      },
+    )
+
+    const json = (await response.json()) as {
+      results: NotionPage[]
+      has_more: boolean
+      next_cursor: string | null
+    }
+
+    return {
+      results: json.results,
+      hasMore: json.has_more,
+      nextCursor: json.next_cursor ?? undefined,
+    }
+  }
+
+  private async fetchAllPages(): Promise<NotionPage[]> {
+    const pages: NotionPage[] = []
     let hasMore = true
     let startCursor: string | undefined
 
@@ -245,28 +322,67 @@ class NotionRepository implements OneEnvRepository {
         body.start_cursor = startCursor
       }
 
-      const response = await this.notionFetch(
-        `/databases/${this.databaseId}/query`,
-        {
-          method: 'POST',
-          body: JSON.stringify(body),
-        },
-      )
-
-      const json = (await response.json()) as {
-        results: Array<{ id: string; properties?: Record<string, unknown> }>
-        has_more: boolean
-        next_cursor: string | null
-      }
-
-      pages.push(...json.results)
-      hasMore = json.has_more
-      startCursor = json.next_cursor ?? undefined
+      const chunk = await this.queryPages(body)
+      pages.push(...chunk.results)
+      hasMore = chunk.hasMore
+      startCursor = chunk.nextCursor
     }
 
     return pages
-      .map((page) => mapPageToRecord(page))
-      .filter((record) => Boolean(record.entityId))
+  }
+
+  private async findPageByEntityId(entityId: string): Promise<NotionPage | null> {
+    const chunk = await this.queryPages({
+      page_size: 1,
+      filter: {
+        property: 'entity_id',
+        rich_text: { equals: entityId },
+      },
+    })
+
+    return chunk.results[0] ?? null
+  }
+
+  async list(): Promise<OneEnvRecord[]> {
+    const cache = this.listCache
+    if (cache && cache.expiresAt > Date.now()) {
+      return this.cloneRecords(cache.records)
+    }
+
+    const currentInFlight = this.listInFlight
+    if (currentInFlight && currentInFlight.revision === this.cacheRevision) {
+      const records = await currentInFlight.promise
+      return this.cloneRecords(records)
+    }
+
+    const revision = this.cacheRevision
+    const promise = (async () => {
+      const pages = await this.fetchAllPages()
+      const records = pages
+        .map((page) => mapPageToRecord(page))
+        .filter((record) => Boolean(record.entityId))
+
+      if (revision === this.cacheRevision) {
+        this.listCache = {
+          records,
+          expiresAt: Date.now() + this.listCacheTtlMs,
+        }
+      }
+
+      return records
+    })()
+
+    const inFlight = { revision, promise }
+    this.listInFlight = inFlight
+
+    try {
+      const records = await promise
+      return this.cloneRecords(records)
+    } finally {
+      if (this.listInFlight === inFlight) {
+        this.listInFlight = null
+      }
+    }
   }
 
   async create(record: Omit<OneEnvRecord, 'pageId'>): Promise<OneEnvRecord> {
@@ -283,6 +399,7 @@ class NotionRepository implements OneEnvRepository {
       properties?: Record<string, unknown>
     }
 
+    this.invalidateListCache()
     return mapPageToRecord(json)
   }
 
@@ -290,19 +407,23 @@ class NotionRepository implements OneEnvRepository {
     entityId: string,
     patch: RecordPatch,
   ): Promise<OneEnvRecord | null> {
-    const all = await this.list()
-    const target = all.find((record) => record.entityId === entityId)
-    if (!target) {
+    const cached = this.getCachedRecordByEntityId(entityId)
+    const targetPage = cached
+      ? { id: cached.pageId }
+      : await this.findPageByEntityId(entityId)
+
+    if (!targetPage) {
       return null
     }
 
-    await this.notionFetch(`/pages/${target.pageId}`, {
+    const response = await this.notionFetch(`/pages/${targetPage.id}`, {
       method: 'PATCH',
       body: JSON.stringify({ properties: buildPatchProperties(patch) }),
     })
 
-    const refreshed = await this.list()
-    return refreshed.find((record) => record.entityId === entityId) ?? null
+    const json = (await response.json()) as NotionPage
+    this.invalidateListCache()
+    return mapPageToRecord(json)
   }
 }
 
